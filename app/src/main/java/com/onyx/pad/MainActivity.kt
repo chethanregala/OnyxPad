@@ -26,12 +26,16 @@ class MainActivity : Activity() {
         pad = PadView(this, { net.send(it) }, { showHostDialog() }, { showLogs() })
         pad.status = "SEARCHING…"
         setContentView(pad)
-        net.start()
     }
 
     override fun onResume() {
         super.onResume()
         if (::net.isInitialized) net.onResume()
+    }
+
+    override fun onPause() {
+        if (::net.isInitialized) net.stop()
+        super.onPause()
     }
 
     @Suppress("DEPRECATION")

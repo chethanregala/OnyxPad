@@ -107,7 +107,7 @@ class Receiver:
         self.phone = None            # (ip, port) of the last packet
         self.last_packet = 0.0
         self.lost = False
-        self.first_report = True
+        self.report_addr = None      # sender of the last 0x01 report
 
         self.pressed = set()
         self.rumble = (0, 0)         # (large, small)
@@ -160,14 +160,15 @@ class Receiver:
         now = time.monotonic()
 
         if data[0] == MSG_REPORT and len(data) >= 10:
+            if self.report_addr != addr:
+                self.report_addr = addr
+                print("[%s] first report from %s:%d" % (clock(), addr[0], addr[1]))
             self.mark_link(addr, now)
-            if self.first_report:
-                self.first_report = False
-                print("[%s] streaming reports - virtual Xbox 360 pad is live" % clock())
             self.apply_report(data[1:10])
             return
 
         if data[: len(PROBE)] == PROBE:
+            print("[%s] ONYX? from %s" % (clock(), addr[0]))
             try:
                 self.sock.sendto(REPLY + HOSTNAME.encode("utf-8"), addr)
             except OSError as exc:
@@ -219,7 +220,7 @@ class Receiver:
               % (clock(), LOST_AFTER))
         self.phone = None
         self.lost = True
-        self.first_report = True
+        self.report_addr = None
         with self.lock:
             self.rumble = (0, 0)
             self.rumble_active = False

@@ -14,7 +14,6 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
-import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.util.ArrayDeque
 import kotlin.math.max
@@ -26,7 +25,8 @@ import kotlin.math.max
  *                  plus an ASCII "ONYX?" probe every second (broadcast until a laptop answers).
  * Laptop -> phone: "ONYX!" + hostname (discovery reply / keepalive) and 0x02 + large + small.
  *
- * All socket work happens on a single background thread; public methods may be called from the UI thread.
+ * One socket is bound to an ephemeral local port for the lifetime of a session (start -> stop).
+ * Each packet carries its destination explicitly; the socket is never connect()ed.
  */
 class NetPad(
     ctx: Context,
@@ -42,60 +42,116 @@ class NetPad(
         const val HEARTBEAT_MS = 50L       // 20 Hz
         const val DISCOVER_MS = 1000L
         const val LOST_MS = 3000L
+        const val RECOVER_MS = 1000L
+        const val TICK_MS = 20L
         const val MAX_LOG = 40
         val REPLY_TAG = "ONYX!".toByteArray(Charsets.US_ASCII)
+        val PROBE = "ONYX?".toByteArray(Charsets.US_ASCII)
+        val BROADCAST_ALL = byteArrayOf(-1, -1, -1, -1) // 255.255.255.255
     }
 
     private val app = ctx.applicationContext
     private val prefs = app.getSharedPreferences(PREF, Context.MODE_PRIVATE)
     private val main = Handler(Looper.getMainLooper())
-    private val vib = app.getSystemService(Vibrator::class.java)
+    private val vibrator = app.getSystemService(Vibrator::class.java)
+
+    private val lifecycleLock = Any()
+    private val socketLock = Any()
+    private val eventsLock = Any()
 
     @Volatile private var running = false
-    @Volatile private var socketRef: DatagramSocket? = null
+    private var recvThread: Thread? = null
+    private var tickThread: Thread? = null
+
+    private var socket: DatagramSocket? = null
+    @Volatile private var recreateAt = 0L
+
     @Volatile private var pending: ByteArray? = null
     @Volatile private var lastReport = ByteArray(9)
     @Volatile private var wantHost: String? = prefs.getString(KEY_HOST, null)
     @Volatile private var target: InetAddress? = null
     @Volatile private var hostName: String = prefs.getString(KEY_NAME, "") ?: ""
     @Volatile private var lastHeard = 0L
-    @Volatile private var forceNow = false
+    @Volatile private var forceDiscover = false
+    @Volatile private var hostRevision = 0
 
     private val events = ArrayDeque<String>(MAX_LOG)
+    private val eventCounts = HashMap<String, Int>()
     private val statusLock = Any()
     private var lastStatus = ""
 
-    /** Starts the UDP worker (idempotent). */
-    @Synchronized
+    /** Starts a session: one socket plus the receive and tick threads. Idempotent. */
     fun start() {
-        if (running) {
-            forceNow = true
-            return
+        synchronized(lifecycleLock) {
+            if (running) return
+            running = true
+            recreateAt = 0
+            target = null
+            lastHeard = 0
+            forceDiscover = true
+            recvThread = Thread({ receiveLoop() }, "onyx-recv").apply {
+                isDaemon = true
+                start()
+            }
+            tickThread = Thread({ tickLoop() }, "onyx-tick").apply {
+                isDaemon = true
+                start()
+            }
         }
-        running = true
-        Thread({ loop() }, "onyx-net").apply { isDaemon = true }.start()
+        setStatus("SEARCHING…")
     }
 
-    /** Reconnect automatically when the app comes back to the foreground. */
-    fun onResume() {
-        start()
-        forceNow = true
-    }
+    /** Called from onResume only. */
+    fun onResume() = start()
 
-    @Synchronized
+    /** Ends the session: closes the socket, joins the threads and resets the session state. */
     fun stop() {
-        running = false
-        try {
-            socketRef?.close()
-        } catch (_: Exception) {
+        var r: Thread? = null
+        var t: Thread? = null
+        synchronized(lifecycleLock) {
+            running = false
+            synchronized(socketLock) {
+                val s = socket
+                socket = null
+                try {
+                    s?.close()
+                } catch (_: Exception) {
+                }
+            }
+            recreateAt = 0
+            r = recvThread
+            t = tickThread
+        }
+        joinQuietly(r)
+        joinQuietly(t)
+        synchronized(lifecycleLock) {
+            recvThread = null
+            tickThread = null
+            pending = null
+            target = null
+            lastHeard = 0
+            forceDiscover = false
+        }
+        synchronized(socketLock) {
+            val s = socket
+            socket = null
+            try {
+                s?.close()
+            } catch (_: Exception) {
+            }
+            recreateAt = 0
+        }
+        synchronized(statusLock) { lastStatus = "" }
+        synchronized(eventsLock) {
+            eventCounts.clear()
         }
         main.post {
             try {
-                vib?.cancel()
+                vibrator?.cancel()
             } catch (_: Exception) {
             }
         }
-        log("stopping")
+        Log.d(TAG, "stopped")
     }
 
     /** Called from the UI thread with PadView's 9-byte report. Never blocks. */
@@ -108,156 +164,202 @@ class NetPad(
 
     fun savedHost(): String = wantHost ?: prefs.getString(KEY_HOST, "") ?: ""
 
-    /** Saves a manual host and starts looking for it immediately. */
+    /**
+     * Changes the manual target only: saves it and lets discovery probe that address.
+     * Never touches the socket.
+     */
     fun setHost(host: String) {
         val h = host.trim()
         wantHost = if (h.isEmpty()) null else h
+        hostRevision++
         val ed = prefs.edit()
         if (h.isEmpty()) ed.remove(KEY_HOST) else ed.putString(KEY_HOST, h)
         ed.apply()
         target = null
         lastHeard = 0
-        forceNow = true
+        forceDiscover = true
         setStatus("SEARCHING…")
-        log(if (h.isEmpty()) "host cleared — auto-discovery" else "host set to $h")
+        log(if (h.isEmpty()) "manual host cleared" else "manual host $h")
     }
 
-    /** Re-runs discovery with the address currently typed in the dialog. */
+    /** Resets discovery state with the address currently typed in the dialog. Never touches the socket. */
     fun retry(host: String) {
         val h = host.trim()
         if (h.isNotEmpty()) {
             setHost(h)
-        } else {
-            target = null
-            lastHeard = 0
-            forceNow = true
-            setStatus("SEARCHING…")
+            return
         }
+        target = null
+        lastHeard = 0
+        forceDiscover = true
+        hostRevision++
+        setStatus("SEARCHING…")
         log("retry requested")
     }
 
-    @Synchronized
-    fun logLines(): List<String> = events.toList()
+    fun logLines(): List<String> = synchronized(eventsLock) { events.toList() }
 
-    private fun loop() {
+    // ------------------------------------------------------------------ receive thread
+
+    private fun receiveLoop() {
+        val buf = ByteArray(256)
         while (running) {
-            var socket: DatagramSocket? = null
-            try {
-                socket = DatagramSocket().apply {
-                    reuseAddress = true
-                    broadcast = true
-                    bind(InetSocketAddress(PORT))
-                    soTimeout = 20
-                }
-                socketRef = socket
-                log("listening on UDP $PORT")
-                session(socket)
-            } catch (e: SocketException) {
-                log("socket error: ${e.message}")
-            } catch (e: Exception) {
-                log("net error: ${e.message}")
-            } finally {
-                try {
-                    socket?.close()
-                } catch (_: Exception) {
-                }
-                socketRef = null
+            val s = synchronized(socketLock) { socket }
+            if (s == null) {
+                pause(100)
+                continue
             }
-            if (running) {
-                try {
-                    Thread.sleep(1000)
-                } catch (_: InterruptedException) {
-                    break
-                }
+            val packet = DatagramPacket(buf, buf.size)
+            try {
+                s.receive(packet)
+            } catch (_: SocketTimeoutException) {
+                continue
+            } catch (e: Exception) {
+                if (!running) break
+                socketFailed(s, "receive error", e)
+                continue
+            }
+            try {
+                handle(packet)
+            } catch (e: Exception) {
+                logError("packet error", e)
             }
         }
-        running = false
-        target = null
-        setStatus("SEARCHING…")
-        log("stopped")
     }
 
-    private fun session(socket: DatagramSocket) {
-        if (target == null) setStatus("SEARCHING…")
+    // ------------------------------------------------------------------ tick thread
 
+    private fun tickLoop() {
         var lastSent = 0L
         var lastDiscover = 0L
         var resolvedKey: String? = null
+        var resolvedRevision = -1
         var resolved: InetAddress? = null
-        var bcAt = 0L
-        var broadcasts: List<InetAddress> = emptyList()
-        val buf = ByteArray(256)
+        var broadcastAt = 0L
+        var broadcastTargets: List<InetAddress> = emptyList()
 
         while (running) {
             val now = SystemClock.elapsedRealtime()
+            val s = ensureSocket()
 
-            // Resolve the saved/manual host off the UI thread.
+            // Resolve a saved/manual host off the UI thread. Retry bumps hostRevision.
             val want = wantHost
+            val revision = hostRevision
             if (want.isNullOrBlank()) {
                 resolvedKey = null
+                resolvedRevision = revision
                 resolved = null
-            } else if (want != resolvedKey) {
+            } else if (want != resolvedKey || revision != resolvedRevision) {
                 resolvedKey = want
+                resolvedRevision = revision
                 resolved = try {
                     InetAddress.getByName(want)
                 } catch (e: Exception) {
-                    log("cannot resolve '$want': ${e.message}")
+                    logError("cannot resolve '$want'", e)
                     null
                 }
             }
 
-            // Report on change, otherwise heartbeat at 20 Hz while connected.
             val change = pending
             if (change != null) {
                 pending = null
                 lastReport = change
             }
-            val t = target
-            if (t != null && (change != null || now - lastSent >= HEARTBEAT_MS)) {
-                sendReport(socket, t, lastReport)
-                lastSent = now
-            }
 
-            // Discovery probes. While connected a unicast probe doubles as a keepalive so the
-            // phone can detect a dead laptop ("LOST" after 3 s without a reply).
-            if (forceNow) {
-                forceNow = false
-                lastDiscover = 0
-            }
-            if (now - lastDiscover >= DISCOVER_MS) {
-                lastDiscover = now
-                if (t != null) {
-                    sendText(socket, t, "ONYX?")
-                } else {
-                    resolved?.let { sendText(socket, it, "ONYX?") }
-                    if (broadcasts.isEmpty() || now - bcAt > 10_000) {
-                        broadcasts = broadcastAddresses()
-                        bcAt = now
+            if (s != null) {
+                val t = target
+
+                // Report on change, otherwise heartbeat at 20 Hz.
+                if (t != null && (change != null || now - lastSent >= HEARTBEAT_MS)) {
+                    if (sendTo(s, reportPacket(lastReport), t)) lastSent = now
+                }
+
+                // Discovery probe. While connected a unicast probe is also the keepalive that
+                // lets the phone notice a dead laptop after 3 s.
+                if (forceDiscover) {
+                    forceDiscover = false
+                    lastDiscover = 0
+                }
+                if (now - lastDiscover >= DISCOVER_MS) {
+                    lastDiscover = now
+                    if (t != null) {
+                        sendTo(s, PROBE, t)
+                        if (resolved != null && resolved.hostAddress != t.hostAddress) {
+                            sendTo(s, PROBE, resolved)
+                        }
+                    } else {
+                        if (broadcastTargets.isEmpty() || now - broadcastAt > 10_000) {
+                            broadcastTargets = broadcastAddresses()
+                            broadcastAt = now
+                        }
+                        for (addr in broadcastTargets) {
+                            if (!sendTo(s, PROBE, addr)) break
+                        }
+                        resolved?.let { sendTo(s, PROBE, it) }
                     }
-                    for (addr in broadcasts) sendText(socket, addr, "ONYX?")
                 }
             }
 
-            // Link timeout.
+            // Link timeout (also while the socket is being recovered).
             val current = target
             if (current != null && lastHeard > 0 && now - lastHeard > LOST_MS) {
-                log("no reply from ${current.hostAddress} for 3 s")
                 target = null
                 lastHeard = 0
                 setStatus("LOST – RECONNECTING…")
-                forceNow = true
+                log("no reply from ${current.hostAddress} for 3 s")
+                forceDiscover = true
             }
 
-            try {
-                val packet = DatagramPacket(buf, buf.size)
-                socket.receive(packet)
-                handle(packet)
-            } catch (_: SocketTimeoutException) {
-            } catch (e: SocketException) {
-                if (running) throw e else break
-            }
+            pause(TICK_MS)
         }
     }
+
+    /** Opens the socket if needed. Recovery attempts are spaced by [RECOVER_MS]. */
+    private fun ensureSocket(): DatagramSocket? {
+        var result: DatagramSocket? = null
+        synchronized(socketLock) {
+            if (!running) return null
+            val existing = socket
+            if (existing != null) {
+                result = existing
+            } else {
+                val now = SystemClock.elapsedRealtime()
+                if (now >= recreateAt) {
+                    try {
+                        val s = DatagramSocket(null)
+                        s.reuseAddress = true
+                        s.broadcast = true
+                        s.soTimeout = 500
+                        s.bind(InetSocketAddress(0))
+                        socket = s
+                        log("socket ready")
+                        result = s
+                    } catch (e: Exception) {
+                        logError("socket open error", e)
+                        recreateAt = SystemClock.elapsedRealtime() + RECOVER_MS
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    /** Closes a broken socket once and schedules its replacement, without touching the status. */
+    private fun socketFailed(s: DatagramSocket, what: String, e: Exception) {
+        if (synchronized(socketLock) { socket } !== s) return
+        logError(what, e)
+        synchronized(socketLock) {
+            if (socket !== s) return
+            socket = null
+            try {
+                s.close()
+            } catch (_: Exception) {
+            }
+            recreateAt = SystemClock.elapsedRealtime() + RECOVER_MS
+        }
+    }
+
+    // ------------------------------------------------------------------ packets
 
     private fun handle(packet: DatagramPacket) {
         val len = packet.length
@@ -299,50 +401,51 @@ class NetPad(
         }
     }
 
+    private fun reportPacket(report: ByteArray): ByteArray {
+        val out = ByteArray(10)
+        out[0] = 0x01
+        System.arraycopy(report, 0, out, 1, 9)
+        return out
+    }
+
+    /** Sends with an explicit destination; never connect()s the socket. */
+    private fun sendTo(s: DatagramSocket, data: ByteArray, to: InetAddress): Boolean {
+        return try {
+            s.send(DatagramPacket(data, data.size, to, PORT))
+            true
+        } catch (e: Exception) {
+            if (running) socketFailed(s, "send error", e)
+            false
+        }
+    }
+
+    // ------------------------------------------------------------------ rumble
+
     /** Runs on the UI thread. */
     private fun rumble(large: Int, small: Int) {
         val amp = max(large, small).coerceIn(0, 255)
         try {
-            vib?.cancel()
-            if (amp > 0) vib?.vibrate(VibrationEffect.createOneShot(2000, amp))
+            vibrator?.cancel()
+            if (amp > 0) vibrator?.vibrate(VibrationEffect.createOneShot(2000, amp))
         } catch (e: Exception) {
-            log("vibration failed: ${e.message}")
+            logError("vibration failed", e)
         }
     }
 
-    private fun sendReport(socket: DatagramSocket, to: InetAddress, report: ByteArray) {
-        try {
-            val out = ByteArray(10)
-            out[0] = 0x01
-            System.arraycopy(report, 0, out, 1, 9)
-            socket.send(DatagramPacket(out, out.size, to, PORT))
-        } catch (_: Exception) {
-            // Transient Wi-Fi failures are handled by the timeout/discovery loop.
-        }
-    }
+    // ------------------------------------------------------------------ helpers
 
-    private fun sendText(socket: DatagramSocket, to: InetAddress, text: String) {
-        try {
-            val data = text.toByteArray(Charsets.US_ASCII)
-            socket.send(DatagramPacket(data, data.size, to, PORT))
-        } catch (_: Exception) {
-        }
-    }
-
-    @Suppress("DEPRECATION")
     private fun broadcastAddresses(): List<InetAddress> {
         val out = ArrayList<InetAddress>()
+        out.add(InetAddress.getByAddress(BROADCAST_ALL))
         try {
-            out.add(InetAddress.getByName("255.255.255.255"))
-        } catch (_: Exception) {
-        }
-        try {
+            @Suppress("DEPRECATION")
             val dhcp = app.getSystemService(WifiManager::class.java)?.dhcpInfo
             if (dhcp != null && dhcp.ipAddress != 0 && dhcp.netmask != 0) {
                 val b = (dhcp.ipAddress and dhcp.netmask) or dhcp.netmask.inv()
                 out.add(ip4(b))
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            logError("subnet broadcast lookup failed", e)
         }
         try {
             val e = NetworkInterface.getNetworkInterfaces()
@@ -369,12 +472,42 @@ class NetPad(
         )
     )
 
-    @Synchronized
-    private fun log(msg: String) {
-        Log.d(TAG, msg)
-        events.addLast(msg)
-        while (events.size > MAX_LOG) events.removeFirst()
-        onEvent(msg)
+    private fun pause(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun joinQuietly(t: Thread?) {
+        if (t == null) return
+        try {
+            t.join(1000)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
+    private fun logError(what: String, e: Throwable) {
+        log("$what: ${e.message ?: e.javaClass.simpleName}", e)
+    }
+
+    /** Logs each distinct event once; repeats update the last-event line with an "(xN)" counter. */
+    private fun log(msg: String, error: Throwable? = null) {
+        if (error != null) Log.e(TAG, msg, error) else Log.d(TAG, msg)
+        var shown = msg
+        synchronized(eventsLock) {
+            val count = (eventCounts[msg] ?: 0) + 1
+            eventCounts[msg] = count
+            if (count == 1) {
+                events.addLast(msg)
+                while (events.size > MAX_LOG) events.removeFirst()
+            } else {
+                shown = "$msg (x$count)"
+            }
+        }
+        onEvent(shown)
     }
 
     private fun setStatus(s: String) {
