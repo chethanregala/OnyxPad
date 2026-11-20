@@ -71,7 +71,7 @@ class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapS
         if (event.isNotEmpty()) {
             fl(0xFF888888.toInt()); p.textSize = ph * .22f
             var t = event
-            val maxW = c.width() * .9f
+            val maxW = c.width * .9f
             if (p.measureText(t) > maxW) {
                 while (t.length > 1 && p.measureText("$t…") > maxW) t = t.dropLast(1)
                 t += "…"
