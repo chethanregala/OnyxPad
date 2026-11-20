@@ -1,39 +1,37 @@
 package com.onyx.pad
 
-import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.bluetooth.BluetoothAdapter
-import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Typeface
-import android.os.Build
 import android.os.Bundle
+import android.text.InputType
 import android.view.View
 import android.view.WindowManager
+import android.widget.EditText
 import android.widget.ScrollView
 import android.widget.TextView
 
 class MainActivity : Activity() {
     private lateinit var pad: PadView
-    private lateinit var hid: HidPad
+    private lateinit var net: NetPad
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        pad = PadView(this, { hid.send(it) }, { pick() }, { showLogs() })
-        hid = HidPad(
+        net = NetPad(
             this,
-            onState = { s -> runOnUiThread { pad.status = s } },
+            onStatus = { s -> runOnUiThread { pad.status = s } },
             onEvent = { e -> runOnUiThread { pad.event = e } })
+        pad = PadView(this, { net.send(it) }, { showHostDialog() }, { showLogs() })
+        pad.status = "SEARCHING…"
         setContentView(pad)
-        if (Build.VERSION.SDK_INT < 31 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) hid.start()
-        else requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE), 1)
+        net.start()
     }
 
-    override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, g: IntArray) {
-        if (g.isNotEmpty() && g[0] == PackageManager.PERMISSION_GRANTED) hid.start()
+    override fun onResume() {
+        super.onResume()
+        if (::net.isInitialized) net.onResume()
     }
 
     @Suppress("DEPRECATION")
@@ -43,22 +41,25 @@ class MainActivity : Activity() {
             View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
     }
 
-    @Suppress("MissingPermission")
-    private fun pick() {
-        val l = hid.paired()
-        val names = if (l.isEmpty()) arrayOf("NO PAIRED DEVICES")
-            else l.map { it.name ?: it.address }.toTypedArray()
+    private fun showHostDialog() {
+        val input = EditText(this).apply {
+            setText(net.savedHost())
+            hint = "192.168.1.42"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+            setPadding(48, 24, 48, 24)
+        }
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog)
-            .setTitle("Select laptop")
-            .setItems(names) { _, i -> if (l.isNotEmpty()) hid.connect(l[i]) }
-            .setNeutralButton("Pair new laptop") { _, _ ->
-                startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
-                    .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120))
-            }.show()
+            .setTitle("Laptop IP")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ -> net.setHost(input.text.toString()) }
+            .setNeutralButton("Retry") { _, _ -> net.retry(input.text.toString()) }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun showLogs() {
-        val lines = hid.logLines()
+        val lines = net.logLines()
         val tv = TextView(this).apply {
             text = if (lines.isEmpty()) "(no log yet)" else lines.joinToString("\n")
             textSize = 11f
@@ -68,11 +69,14 @@ class MainActivity : Activity() {
         }
         val scroll = ScrollView(this).apply { addView(tv) }
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog)
-            .setTitle("HID log (${lines.size}/40)")
+            .setTitle("NET log (${lines.size}/40)")
             .setView(scroll)
             .setPositiveButton("Close") { _, _ -> }
             .show()
     }
 
-    override fun onDestroy() { hid.stop(); super.onDestroy() }
+    override fun onDestroy() {
+        net.stop()
+        super.onDestroy()
+    }
 }
