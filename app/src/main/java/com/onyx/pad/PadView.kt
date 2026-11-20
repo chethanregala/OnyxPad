@@ -13,7 +13,12 @@ private class Btn(val bit: Int, val shape: String) {
     val circ = shape in setOf("tri", "crs", "sqr", "cir")
 }
 
-class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapStatus: () -> Unit) : View(c) {
+class PadView(
+    c: Context,
+    private val out: (ByteArray) -> Unit,
+    private val tapStatus: () -> Unit,
+    private val onLongPress: () -> Unit = {}
+) : View(c) {
     var status = "REGISTERING…"
         set(v) { field = v; postInvalidate() }
     var event = ""
@@ -36,6 +41,15 @@ class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapS
     private var u = 1f
     private var mask = 0
     private var last = ByteArray(9)
+    private var pillId = -1
+    private var pillHeld = false
+    private val pillLongPress = Runnable {
+        if (pillHeld) {
+            pillHeld = false; pillId = -1
+            click()
+            onLongPress()
+        }
+    }
 
     override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
         u = h / 100f; sr = 17 * u
@@ -128,7 +142,13 @@ class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapS
     }
 
     private fun down(id: Int, x: Float, y: Float) {
-        if (pill.contains(x, y)) { click(); tapStatus(); return }
+        if (pill.contains(x, y)) {
+            if (!pillHeld) {
+                pillHeld = true; pillId = id
+                postDelayed(pillLongPress, 600L)
+            }
+            return
+        }
         for (s in 0..1) if (hypot(x - sc[s].x, y - sc[s].y) < sr * 1.4f) { sp[id] = s; move(id, x, y); return }
         btns.firstOrNull { it.r.contains(x, y) }?.let { bp[id] = it; mask = mask or (1 shl it.bit); click() }
     }
@@ -144,6 +164,11 @@ class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapS
     }
 
     private fun up(id: Int) {
+        if (id == pillId) {
+            pillHeld = false; pillId = -1
+            removeCallbacks(pillLongPress)
+            click(); tapStatus()
+        }
         sp.remove(id)?.let { axes[2 * it] = 0f; axes[2 * it + 1] = 0f; edge[it] = false }
         bp.remove(id)?.let { mask = mask and (1 shl it.bit).inv() }
     }
@@ -154,7 +179,10 @@ class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapS
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> down(e.getPointerId(i), e.getX(i), e.getY(i))
             MotionEvent.ACTION_MOVE -> for (k in 0 until e.pointerCount) move(e.getPointerId(k), e.getX(k), e.getY(k))
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> up(e.getPointerId(i))
-            MotionEvent.ACTION_CANCEL -> for (id in (bp.keys + sp.keys).toList()) up(id)
+            MotionEvent.ACTION_CANCEL -> {
+                pillHeld = false; pillId = -1; removeCallbacks(pillLongPress)
+                for (id in (bp.keys + sp.keys).toList()) up(id)
+            }
         }
         push(); invalidate(); return true
     }

@@ -6,10 +6,13 @@ import android.app.AlertDialog
 import android.bluetooth.BluetoothAdapter
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
+import android.widget.ScrollView
+import android.widget.TextView
 
 class MainActivity : Activity() {
     private lateinit var pad: PadView
@@ -19,7 +22,7 @@ class MainActivity : Activity() {
         super.onCreate(b)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        pad = PadView(this, { hid.send(it) }, { pick() })
+        pad = PadView(this, { hid.send(it) }, { pick() }, { showLogs() })
         hid = HidPad(
             this,
             onState = { s -> runOnUiThread { pad.status = s } },
@@ -52,6 +55,23 @@ class MainActivity : Activity() {
                 startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
                     .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120))
             }.show()
+    }
+
+    private fun showLogs() {
+        val lines = hid.logLines()
+        val tv = TextView(this).apply {
+            text = if (lines.isEmpty()) "(no log yet)" else lines.joinToString("\n")
+            textSize = 11f
+            typeface = Typeface.MONOSPACE
+            setTextIsSelectable(true)
+            setPadding(32, 24, 32, 24)
+        }
+        val scroll = ScrollView(this).apply { addView(tv) }
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog)
+            .setTitle("HID log (${lines.size}/40)")
+            .setView(scroll)
+            .setPositiveButton("Close") { _, _ -> }
+            .show()
     }
 
     override fun onDestroy() { hid.stop(); super.onDestroy() }
