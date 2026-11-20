@@ -14,7 +14,9 @@ private class Btn(val bit: Int, val shape: String) {
 }
 
 class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapStatus: () -> Unit) : View(c) {
-    var status = "TAP TO CONNECT"
+    var status = "REGISTERING…"
+        set(v) { field = v; postInvalidate() }
+    var event = ""
         set(v) { field = v; postInvalidate() }
 
     private val vib = c.getSystemService(Vibrator::class.java)
@@ -65,6 +67,17 @@ class PadView(c: Context, private val out: (ByteArray) -> Unit, private val tapS
         c.drawCircle(pill.left + ph * .5f, pill.centerY(), ph * .12f, p)
         fl(Color.WHITE); p.textSize = ph * .36f
         c.drawText(status, pill.centerX(), pill.centerY() + p.textSize * .35f, p)
+        // last HID event, small gray line under the pill
+        if (event.isNotEmpty()) {
+            fl(0xFF888888.toInt()); p.textSize = ph * .22f
+            var t = event
+            val maxW = c.width() * .9f
+            if (p.measureText(t) > maxW) {
+                while (t.length > 1 && p.measureText("$t…") > maxW) t = t.dropLast(1)
+                t += "…"
+            }
+            c.drawText(t, pill.centerX(), pill.bottom + ph * .45f, p)
+        }
         // sticks
         for (s in 0..1) {
             val cx = sc[s].x; val cy = sc[s].y; val act = sp.containsValue(s)

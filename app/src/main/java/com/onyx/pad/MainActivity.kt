@@ -20,7 +20,10 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         pad = PadView(this, { hid.send(it) }, { pick() })
-        hid = HidPad(this) { s -> runOnUiThread { pad.status = s } }
+        hid = HidPad(
+            this,
+            onState = { s -> runOnUiThread { pad.status = s } },
+            onEvent = { e -> runOnUiThread { pad.event = e } })
         setContentView(pad)
         if (Build.VERSION.SDK_INT < 31 || checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED) hid.start()
         else requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_ADVERTISE), 1)
@@ -40,9 +43,11 @@ class MainActivity : Activity() {
     @Suppress("MissingPermission")
     private fun pick() {
         val l = hid.paired()
+        val names = if (l.isEmpty()) arrayOf("NO PAIRED DEVICES")
+            else l.map { it.name ?: it.address }.toTypedArray()
         AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog)
             .setTitle("Select laptop")
-            .setItems(l.map { it.name ?: it.address }.toTypedArray()) { _, i -> hid.connect(l[i]) }
+            .setItems(names) { _, i -> if (l.isNotEmpty()) hid.connect(l[i]) }
             .setNeutralButton("Pair new laptop") { _, _ ->
                 startActivity(Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
                     .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120))
